@@ -72,6 +72,9 @@ type JMXFetch struct {
 	defaultJmxCommand  string
 	cmd                *exec.Cmd
 	exitFilePath       string
+	managed            bool
+	shutdown           chan struct{}
+	stopped            chan struct{}
 }
 
 func (j *JMXFetch) setDefaults() {
@@ -93,7 +96,7 @@ func (j *JMXFetch) setDefaults() {
 }
 
 // Start starts the JMXFetch process
-func (j *JMXFetch) Start() error {
+func (j *JMXFetch) Start(manage bool) error {
 	j.setDefaults()
 
 	here, _ := executable.Folder()
@@ -224,24 +227,69 @@ func (j *JMXFetch) Start() error {
 
 	log.Debugf("Args: %v", subprocessArgs)
 
-	return j.cmd.Start()
+	err = j.cmd.Start()
+
+	// start syncrhonization channels
+	if err == nil && manage {
+		j.managed = manage
+		j.shutdown = make(chan struct{})
+		j.stopped = make(chan struct{})
+
+		go j.Monitor()
+	}
+
+	return err
+}
+
+func (j *JMXFetch) Monitor() {
+	stopIdx := 0
+	maxRestarts := config.Datadog.GetInt("jmx_max_restarts")
+	stopTimes := make([]time.Time, maxRestarts)
+
+	for {
+		// TODO: what should we do with the exit codes
+		j.Wait()
+		stopTimes[stopIdx] = time.Now()
+
+		if stopTimes[stopIdx].Sub(stopTimes[stopIdx-maxRestarts]).Seconds() < float64(config.Datadog.GetInt("jmx_restart_interval")) {
+			log.Errorf("Too many JMXFetch restarts (%v) in time interval (%vs) - giving up")
+			close(j.stopped)
+		}
+
+		select {
+		case <-j.shutdown:
+			close(j.stopped)
+			return
+		default:
+			// restart
+			log.Warnf("JMXFetch process had to be restarted.")
+			j.cmd.Start()
+		}
+	}
 }
 
 // Stop stops the JMXFetch process
 func (j *JMXFetch) Stop() error {
-	if j.JmxExitFile == "" {
-		stopped := make(chan struct{})
+	var stopChan chan struct{}
 
+	if j.JmxExitFile == "" {
 		// Unix
 		err := j.cmd.Process.Signal(syscall.SIGTERM)
 		if err != nil {
 			return err
 		}
 
-		go func() {
-			j.Wait()
-			close(stopped)
-		}()
+		if j.managed {
+			stopChan = j.stopped
+			close(j.shutdown)
+		} else {
+			stopChan = make(chan struct{})
+
+			go func() {
+				j.Wait()
+				close(stopChan)
+			}()
+		}
 
 		select {
 		case <-time.After(time.Millisecond * 500):
@@ -250,7 +298,7 @@ func (j *JMXFetch) Stop() error {
 			if err != nil {
 				log.Warnf("Could not kill jmxfetch: %v", err)
 			}
-		case <-stopped:
+		case <-stopChan:
 		}
 
 	} else {
